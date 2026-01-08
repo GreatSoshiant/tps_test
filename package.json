@@ -1,0 +1,16 @@
+{
+  "name": "arbitrum-tps-test",
+  "version": "1.0.0",
+  "description": "TPS battle test script for Arbitrum Nitro dev node",
+  "main": "tps-test.js",
+  "type": "module",
+  "scripts": {
+    "test": "node tps-test.js",
+    "quick": "node tps-test.js --txCount=500 --senders=50 --concurrent=100",
+    "medium": "node tps-test.js --txCount=3000 --senders=100 --concurrent=200",
+    "stress": "node tps-test.js --txCount=10000 --senders=150 --concurrent=300"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  }
+}
