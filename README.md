@@ -25,7 +25,7 @@ A comprehensive stress testing tool for measuring the maximum TPS (Transactions 
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/arbitrum-tps-test.git
+git clone https://github.com/GreatSoshiant/tps_test.git
 cd arbitrum-tps-test
 npm install
 ```
