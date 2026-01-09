@@ -15,7 +15,7 @@ const CONFIG = {
   txCount: 1000,          // Total transactions to send
   senderCount: 50,        // Number of sender accounts (more = more parallelism!)
   txValue: '0.00000001',  // ETH value per transaction (10 gwei = 0.00000001 ETH)
-  fundingAmount: '0.1',  // ETH to fund each sender account (enough for many tiny txs)
+  fundingAmount: '0.01',  // ETH to fund each sender account (enough for many tiny txs)
   
   // Gas settings
   gasLimit: 21000,        // Standard ETH transfer gas
@@ -688,13 +688,13 @@ async function analyzeBlockTPS(provider, receipts, broadcastStartTime, broadcast
   }
   console.log(`   ${'─'.repeat(75)}`);
   
-  // FULL VERIFICATION: If --verifyAll is set, verify EVERY transaction individually
+  // FULL VERIFICATION: If --verifyAll is set, verify EVERY transaction individually using worker pool
   let fullVerifiedCount = verifiedTxCount; // Default to block-based verification
   
   if (config.verifyAll) {
     console.log(`\n🔬 FULL VERIFICATION: Fetching ALL ${receipts.length} transactions by hash...`);
     console.log(`   Checking each tx: hash exists → receipt exists → status=1 → block mined → data matches`);
-    console.log(`   This will take a while...`);
+    console.log(`   Using worker pool with ${config.concurrentRequests} concurrent requests...`);
     
     fullVerifiedCount = 0;
     let fullVerifyErrors = 0;
@@ -703,33 +703,46 @@ async function analyzeBlockTPS(provider, receipts, broadcastStartTime, broadcast
     let statusFailed = 0;
     let notMined = 0;
     let dataMismatch = 0;
-    const batchSize = 50;
+    let errorCount = 0;
     
-    for (let i = 0; i < receipts.length; i += batchSize) {
-      const batch = receipts.slice(i, i + batchSize);
-      
-      const verifyPromises = batch.map(async (receipt) => {
+    // Worker pool pattern for parallel verification
+    let nextIndex = 0;
+    const startTime = Date.now();
+    
+    const verifyWorker = async () => {
+      while (nextIndex < receipts.length) {
+        const idx = nextIndex++;
+        const receipt = receipts[idx];
+        
         try {
           // 1. Fetch transaction by hash
           const tx = await provider.getTransaction(receipt.hash);
           if (!tx) {
-            return { ok: false, reason: 'not_found' };
+            notFound++;
+            fullVerifyErrors++;
+            continue;
           }
           
           // 2. Fetch receipt by hash
           const txReceipt = await provider.getTransactionReceipt(receipt.hash);
           if (!txReceipt) {
-            return { ok: false, reason: 'no_receipt' };
+            noReceipt++;
+            fullVerifyErrors++;
+            continue;
           }
           
           // 3. Check receipt status (1 = success, 0 = reverted)
           if (txReceipt.status !== 1) {
-            return { ok: false, reason: 'status_failed' };
+            statusFailed++;
+            fullVerifyErrors++;
+            continue;
           }
           
           // 4. Check it's actually mined in a block
           if (!txReceipt.blockNumber || txReceipt.blockNumber <= 0) {
-            return { ok: false, reason: 'not_mined' };
+            notMined++;
+            fullVerifyErrors++;
+            continue;
           }
           
           // 5. Verify transaction data matches what we sent
@@ -738,38 +751,43 @@ async function analyzeBlockTPS(provider, receipts, broadcastStartTime, broadcast
           const valueOk = tx.value === expectedTxDetails.value;
           
           if (!fromOk || !toOk || !valueOk) {
-            return { ok: false, reason: 'data_mismatch' };
+            dataMismatch++;
+            fullVerifyErrors++;
+            continue;
           }
           
           // ALL CHECKS PASSED
-          return { ok: true, blockNumber: txReceipt.blockNumber };
-        } catch (err) {
-          return { ok: false, reason: 'error' };
-        }
-      });
-      
-      const results = await Promise.all(verifyPromises);
-      
-      for (const result of results) {
-        if (result.ok) {
           fullVerifiedCount++;
-        } else {
+        } catch (err) {
+          errorCount++;
           fullVerifyErrors++;
-          if (result.reason === 'not_found') notFound++;
-          else if (result.reason === 'no_receipt') noReceipt++;
-          else if (result.reason === 'status_failed') statusFailed++;
-          else if (result.reason === 'not_mined') notMined++;
-          else if (result.reason === 'data_mismatch') dataMismatch++;
+        }
+        
+        // Progress update every 100 txs
+        const completed = fullVerifiedCount + fullVerifyErrors;
+        if (completed % 100 === 0 || completed === receipts.length) {
+          const elapsed = Date.now() - startTime;
+          const rate = (completed / elapsed) * 1000;
+          process.stdout.write(`\r   Verified: ${completed}/${receipts.length} (${rate.toFixed(0)}/s) | ✓${fullVerifiedCount} | ✗${fullVerifyErrors}`);
         }
       }
-      
-      // Progress
-      const progress = Math.min(i + batchSize, receipts.length);
-      process.stdout.write(`\r   Verified: ${progress}/${receipts.length} | ✓${fullVerifiedCount} | ✗${fullVerifyErrors}`);
+    };
+    
+    // Start worker pool
+    const workers = [];
+    const workerCount = Math.min(config.concurrentRequests, receipts.length);
+    for (let i = 0; i < workerCount; i++) {
+      workers.push(verifyWorker());
     }
+    
+    await Promise.all(workers);
+    
+    const verifyDuration = Date.now() - startTime;
+    const verifyRate = (receipts.length / verifyDuration) * 1000;
     
     console.log(`\n\n   📊 FULL VERIFICATION RESULTS:`);
     console.log(`   ✅ Fully verified & confirmed: ${fullVerifiedCount}/${receipts.length}`);
+    console.log(`   ⏱️  Verification time: ${(verifyDuration / 1000).toFixed(2)}s (${verifyRate.toFixed(0)} tx/s)`);
     
     if (fullVerifyErrors > 0) {
       console.log(`   ❌ Failed verifications: ${fullVerifyErrors}`);
@@ -778,6 +796,7 @@ async function analyzeBlockTPS(provider, receipts, broadcastStartTime, broadcast
       if (statusFailed > 0) console.log(`      - Receipt status=0 (reverted): ${statusFailed}`);
       if (notMined > 0) console.log(`      - Not mined in block: ${notMined}`);
       if (dataMismatch > 0) console.log(`      - Data mismatch (from/to/value): ${dataMismatch}`);
+      if (errorCount > 0) console.log(`      - RPC errors: ${errorCount}`);
     }
     
     // Update verified counts with full verification results
