@@ -1,4 +1,9 @@
 import { ethers } from 'ethers';
+import * as readline from 'readline';
+import { generatePayload, signTransactions, parseTxMix, getRequiredContracts, calculateFundingNeeds, ERC20_ABI, ROUTER_ABI } from './payload-generator.js';
+import { deployToken } from './deploy-token.js';
+import { deployUniswap } from './deploy-uniswap.js';
+import * as ui from './terminal-ui.js';
 
 // =============================================================================
 // Configuration
@@ -14,8 +19,12 @@ const CONFIG = {
   // Test parameters (can be overridden via CLI args)
   txCount: 1000,          // Total transactions to send
   senderCount: 50,        // Number of sender accounts (more = more parallelism!)
-  txValue: '0.00000001',  // ETH value per transaction (10 gwei = 0.00000001 ETH)
+  txValue: '0.00000001',  // ETH value per ETH transfer (10 gwei = 0.00000001 ETH)
   fundingAmount: '0.01',  // ETH to fund each sender account (enough for many tiny txs)
+  
+  // Token/Swap specific values
+  tokenTxValue: '100',    // Tokens per token transfer
+  swapValue: '0.0001',    // ETH per swap
   
   // Gas settings
   gasLimit: 21000,        // Standard ETH transfer gas
@@ -26,8 +35,21 @@ const CONFIG = {
   // Gas buffer multiplier (to handle base fee increases during test)
   gasMultiplier: 2,       // 2x = safe for most tests, increase for long tests
   
+  // Transaction mix (percentages for eth:token:swap)
+  // Format: "eth:token:swap" e.g., "50:30:20" or "100:0:0" (default)
+  txMix: { ethTransfer: 100, tokenTransfer: 0, swap: 0 },
+  
   // Verification
   verifyAll: false,       // If true, fetch and verify EVERY transaction individually
+  
+  // Contract addresses (filled during setup if needed)
+  contracts: {
+    token: null,
+    weth: null,
+    router: null,
+    factory: null,
+    pair: null,
+  },
 };
 
 // =============================================================================
@@ -36,7 +58,13 @@ const CONFIG = {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const config = { ...CONFIG };
+  const config = { ...CONFIG, contracts: { ...CONFIG.contracts } };
+  
+  // Check if interactive mode requested or no args
+  if (args.length === 0 || args.includes('--interactive') || args.includes('-i')) {
+    config.interactive = true;
+    return config;
+  }
   
   for (const arg of args) {
     const [key, value] = arg.replace('--', '').split('=');
@@ -48,6 +76,108 @@ function parseArgs() {
     if (key === 'fundingAmount') config.fundingAmount = value;
     if (key === 'gasMultiplier') config.gasMultiplier = parseFloat(value);
     if (key === 'verifyAll') config.verifyAll = value === 'true' || value === undefined;
+    if (key === 'tokenTxValue') config.tokenTxValue = value;
+    if (key === 'swapValue') config.swapValue = value;
+    
+    // Transaction mix: --txMix=50:30:20 (eth:token:swap)
+    if (key === 'txMix') {
+      config.txMix = parseTxMix(value);
+    }
+    
+    // Pre-deployed contract addresses (optional, skip deployment)
+    if (key === 'token') config.contracts.token = value;
+    if (key === 'weth') config.contracts.weth = value;
+    if (key === 'router') config.contracts.router = value;
+  }
+  
+  return config;
+}
+
+// =============================================================================
+// Interactive Input Mode
+// =============================================================================
+
+function prompt(rl, question, defaultValue) {
+  return new Promise((resolve) => {
+    const defaultStr = defaultValue !== undefined ? ` (${defaultValue})` : '';
+    rl.question(`${question}${defaultStr}: `, (answer) => {
+      resolve(answer.trim() || String(defaultValue));
+    });
+  });
+}
+
+async function interactiveConfig(config) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  
+  ui.printSection('Configuration', '⚙️');
+  console.log(`${ui.colors.dim}Press Enter to use default values shown in parentheses.${ui.colors.reset}\n`);
+  
+  try {
+    // Transaction count
+    const txCount = await prompt(rl, '📊 Total transactions to send', config.txCount);
+    config.txCount = parseInt(txCount) || config.txCount;
+    
+    // Sender count
+    const senderCount = await prompt(rl, '👥 Number of sender wallets', config.senderCount);
+    config.senderCount = parseInt(senderCount) || config.senderCount;
+    
+    // Concurrent requests
+    const concurrent = await prompt(rl, '⚡ Concurrent HTTP requests', config.concurrentRequests);
+    config.concurrentRequests = parseInt(concurrent) || config.concurrentRequests;
+    
+    // Transaction mix - smart input
+    console.log('\n📦 Transaction Mix (must sum to 100%)');
+    const ethPercent = await prompt(rl, '   ETH transfer %', config.txMix.ethTransfer);
+    const eth = parseInt(ethPercent) || 0;
+    
+    let token = 0;
+    let swap = 0;
+    
+    if (eth < 100) {
+      const remaining = 100 - eth;
+      const tokenPercent = await prompt(rl, `   Token transfer % (remaining: ${remaining})`, Math.min(config.txMix.tokenTransfer, remaining));
+      token = Math.min(parseInt(tokenPercent) || 0, remaining);
+      
+      swap = 100 - eth - token;
+      if (swap > 0) {
+        console.log(`   Swap %: ${swap} (auto-calculated)`);
+      }
+    } else {
+      console.log('   100% ETH transfers - skipping token/swap options');
+    }
+    
+    config.txMix = {
+      ethTransfer: eth,
+      tokenTransfer: token,
+      swap: swap,
+    };
+    
+    // Verify all
+    const verifyAll = await prompt(rl, '\n🔍 Verify all transactions individually? (yes/no)', config.verifyAll ? 'yes' : 'no');
+    config.verifyAll = verifyAll.toLowerCase() === 'yes' || verifyAll.toLowerCase() === 'y';
+    
+    // Summary box
+    const summaryContent = 
+      `  Transactions:  ${ui.style.value(config.txCount)}\n` +
+      `  Senders:       ${ui.style.value(config.senderCount)}\n` +
+      `  Concurrent:    ${ui.style.value(config.concurrentRequests)}\n` +
+      `  Mix:           ${ui.style.value(`${config.txMix.ethTransfer}% ETH`)} │ ${ui.style.value(`${config.txMix.tokenTransfer}% Token`)} │ ${ui.style.value(`${config.txMix.swap}% Swap`)}\n` +
+      `  Verify all:    ${config.verifyAll ? ui.style.success('Yes') : ui.style.dim('No')}`;
+    
+    console.log('\n' + ui.drawBox('Configuration Summary', summaryContent));
+    
+    const confirm = await prompt(rl, `\n${ui.colors.brightGreen}▶${ui.colors.reset} Start test? (yes/no)`, 'yes');
+    
+    if (confirm.toLowerCase() !== 'yes' && confirm.toLowerCase() !== 'y') {
+      ui.error('Test cancelled.');
+      process.exit(0);
+    }
+    
+  } finally {
+    rl.close();
   }
   
   return config;
@@ -67,10 +197,118 @@ function formatDuration(ms) {
 }
 
 // =============================================================================
+// Contract Deployment (Token + Uniswap if needed)
+// =============================================================================
+
+async function setupContracts(config, provider, funderWallet) {
+  const { needsToken, needsUniswap } = getRequiredContracts(config.txMix);
+  
+  if (!needsToken && !needsUniswap) {
+    console.log('\n📦 No contracts needed for ETH-only transfers');
+    return config.contracts;
+  }
+  
+  console.log('\n' + '='.repeat(60));
+  console.log('📦 CONTRACT SETUP PHASE');
+  console.log('='.repeat(60));
+  console.log(`   Needs Token: ${needsToken}`);
+  console.log(`   Needs Uniswap: ${needsUniswap}`);
+  
+  const contracts = { ...config.contracts };
+  
+  // Check if contracts are already provided
+  if (contracts.token && (!needsUniswap || (contracts.weth && contracts.router))) {
+    console.log('\n✅ Using pre-deployed contracts:');
+    console.log(`   Token: ${contracts.token}`);
+    if (needsUniswap) {
+      console.log(`   WETH: ${contracts.weth}`);
+      console.log(`   Router: ${contracts.router}`);
+    }
+    return contracts;
+  }
+  
+  // Deploy Token if needed
+  if (needsToken && !contracts.token) {
+    console.log('\n🪙 Deploying Test Token...');
+    
+    const tokenResult = await deployToken({
+      rpcUrl: config.rpcUrl,
+      deployerPrivateKey: config.funderPrivateKey,
+      tokenName: 'TPS Test Token',
+      tokenSymbol: 'TPSTEST',
+      tokenDecimals: 18,
+      initialSupply: '10000000000', // 10 billion tokens
+    });
+    
+    contracts.token = tokenResult.contractAddress;
+    console.log(`✅ Token deployed: ${contracts.token}`);
+  }
+  
+  // Deploy Uniswap if needed
+  if (needsUniswap && !contracts.router) {
+    console.log('\n🦄 Deploying Uniswap V2...');
+    
+    const uniswapResult = await deployUniswap({
+      rpcUrl: config.rpcUrl,
+      deployerPrivateKey: config.funderPrivateKey,
+    });
+    
+    contracts.weth = uniswapResult.weth.address;
+    contracts.factory = uniswapResult.factory.address;
+    contracts.router = uniswapResult.router.address;
+    
+    console.log(`✅ WETH: ${contracts.weth}`);
+    console.log(`✅ Factory: ${contracts.factory}`);
+    console.log(`✅ Router: ${contracts.router}`);
+    
+    // Create liquidity pool
+    console.log('\n💧 Creating Token/ETH liquidity pool...');
+    
+    const token = new ethers.Contract(contracts.token, ERC20_ABI, funderWallet);
+    const router = new ethers.Contract(contracts.router, ROUTER_ABI, funderWallet);
+    
+    // Approve router for initial liquidity
+    const liquidityTokenAmount = ethers.parseUnits('1000000000', 18); // 1B tokens
+    const liquidityEthAmount = ethers.parseEther('100'); // 100 ETH (makes token cheap)
+    
+    let nonce = await funderWallet.getNonce();
+    
+    const approveTx = await token.approve(contracts.router, liquidityTokenAmount, { nonce: nonce++ });
+    await approveTx.wait();
+    console.log(`   Approved router to spend tokens`);
+    
+    // Add liquidity
+    const deadline = Math.floor(Date.now() / 1000) + 3600;
+    const addLiqTx = await router.addLiquidityETH(
+      contracts.token,
+      liquidityTokenAmount,
+      liquidityTokenAmount,
+      liquidityEthAmount,
+      funderWallet.address,
+      deadline,
+      { value: liquidityEthAmount, nonce: nonce++, gasLimit: 5000000 }
+    );
+    await addLiqTx.wait();
+    
+    // Get pair address
+    const factoryAbi = ['function getPair(address, address) view returns (address)'];
+    const factory = new ethers.Contract(contracts.factory, factoryAbi, provider);
+    contracts.pair = await factory.getPair(contracts.token, contracts.weth);
+    
+    console.log(`✅ Liquidity added! Pair: ${contracts.pair}`);
+    console.log(`   Price: 1 ETH = ${Number(liquidityTokenAmount) / Number(liquidityEthAmount) / 1e18 * 1e18} tokens`);
+  }
+  
+  console.log('\n' + '='.repeat(60));
+  
+  return contracts;
+}
+
+// =============================================================================
 // Account Management
 // =============================================================================
 
-async function createAndFundSenders(provider, funderWallet, count, fundingAmount, config) {
+async function createAndFundSenders(provider, funderWallet, count, config, contracts) {
   console.log(`\n📦 Creating ${count} sender accounts...`);
   
   const senders = [];
@@ -82,7 +320,18 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
   }
   
   console.log(`✅ Created ${count} wallets`);
+  
+  // Calculate funding needs based on tx mix
+  const fundingNeeds = calculateFundingNeeds(config, count);
+  const ethFunding = fundingNeeds.ethPerSender;
+  const tokenFunding = fundingNeeds.tokensPerSender;
+  
   console.log(`\n💸 Funding ${count} sender accounts...`);
+  console.log(`   ETH per sender: ${ethers.formatEther(ethFunding)} ETH`);
+  
+  if (config.txMix.tokenTransfer > 0) {
+    console.log(`   Tokens per sender: ${ethers.formatUnits(tokenFunding, 18)} tokens`);
+  }
   
   // Get funder's nonce and fee data with buffer
   let nonce = await funderWallet.getNonce();
@@ -93,15 +342,15 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
   const multiplier = BigInt(Math.floor((config.gasMultiplier || 2) * 100));
   const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice) * multiplier / 100n;
   
-  // Pre-sign all funding transactions
-  console.log(`   Pre-signing ${count} funding transactions...`);
+  // Pre-sign all ETH funding transactions
+  console.log(`   Pre-signing ${count} ETH funding transactions...`);
   const fundingTxs = [];
   const txHashes = [];
   
   for (let i = 0; i < senders.length; i++) {
     const tx = {
       to: senders[i].address,
-      value: ethers.parseEther(fundingAmount),
+      value: ethFunding,
       nonce: nonce++,
       gasLimit: 21000,
       chainId: chainId,
@@ -114,12 +363,11 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
     fundingTxs.push({ signedTx, senderIdx: i });
   }
   
-  // Broadcast funding transactions
-  console.log(`   Broadcasting ${count} funding transactions...`);
+  // Broadcast ETH funding transactions
+  console.log(`   Broadcasting ${count} ETH funding transactions...`);
   let broadcastSuccess = 0;
   let broadcastFailed = 0;
   
-  // Send in batches to avoid overwhelming
   const batchSize = Math.min(200, count);
   for (let i = 0; i < fundingTxs.length; i += batchSize) {
     const batch = fundingTxs.slice(i, i + batchSize);
@@ -151,26 +399,25 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
     broadcastSuccess += results.filter(r => r).length;
     broadcastFailed += results.filter(r => !r).length;
     
-    process.stdout.write(`\r   Broadcast: ${i + batch.length}/${count} (✓${broadcastSuccess} ✗${broadcastFailed})`);
+    process.stdout.write(`\r   ETH Broadcast: ${i + batch.length}/${count} (✓${broadcastSuccess} ✗${broadcastFailed})`);
   }
   console.log();
   
   if (broadcastSuccess === 0) {
-    console.log(`❌ All funding transactions failed to broadcast`);
+    console.log(`❌ All ETH funding transactions failed to broadcast`);
     return [];
   }
   
-  // Wait for funding transactions to be mined (poll until most are confirmed)
-  console.log(`   Waiting for funding transactions to confirm...`);
+  // Wait for ETH funding to confirm
+  console.log(`   Waiting for ETH funding to confirm...`);
   const startWait = Date.now();
-  const timeout = Math.max(30000, count * 10); // At least 30s, or 10ms per tx
+  const timeout = Math.max(30000, count * 10);
   
   let funded = 0;
   let lastFunded = 0;
   let stableCount = 0;
   
   while (Date.now() - startWait < timeout) {
-    // Check balances in batches
     let currentFunded = 0;
     
     for (let i = 0; i < senders.length; i += 100) {
@@ -184,12 +431,8 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
     const elapsed = ((Date.now() - startWait) / 1000).toFixed(1);
     process.stdout.write(`\r   Funded: ${funded}/${count} (${elapsed}s elapsed)`);
     
-    // Check if all funded or funding has stabilized
-    if (funded >= broadcastSuccess) {
-      break;
-    }
+    if (funded >= broadcastSuccess) break;
     
-    // If no progress for 3 checks, stop waiting
     if (funded === lastFunded) {
       stableCount++;
       if (stableCount >= 5) {
@@ -205,7 +448,7 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
   }
   console.log();
   
-  // Final balance check and filter funded senders
+  // Filter funded senders
   const fundedSenders = [];
   for (const sender of senders) {
     try {
@@ -218,7 +461,134 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
     }
   }
   
-  console.log(`✅ Funded ${fundedSenders.length}/${count} sender accounts`);
+  console.log(`✅ ETH funded ${fundedSenders.length}/${count} sender accounts`);
+  
+  // Distribute tokens if needed
+  if (config.txMix.tokenTransfer > 0 && contracts.token && fundedSenders.length > 0) {
+    console.log(`\n🪙 Distributing tokens to senders...`);
+    
+    const token = new ethers.Contract(contracts.token, ERC20_ABI, funderWallet);
+    nonce = await funderWallet.getNonce();
+    
+    // Pre-sign token transfers
+    const tokenTxs = [];
+    const iface = new ethers.Interface(ERC20_ABI);
+    
+    for (let i = 0; i < fundedSenders.length; i++) {
+      const data = iface.encodeFunctionData('transfer', [fundedSenders[i].address, tokenFunding]);
+      const tx = {
+        to: contracts.token,
+        value: 0n,
+        data: data,
+        nonce: nonce++,
+        gasLimit: 100000n,
+        chainId: chainId,
+        type: 2,
+        maxFeePerGas: maxFeePerGas,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas || 0n,
+      };
+      
+      const signedTx = await funderWallet.signTransaction(tx);
+      tokenTxs.push({ signedTx, senderIdx: i });
+    }
+    
+    // Broadcast token transfers
+    let tokenSuccess = 0;
+    for (let i = 0; i < tokenTxs.length; i += batchSize) {
+      const batch = tokenTxs.slice(i, i + batchSize);
+      
+      const batchPromises = batch.map(async ({ signedTx }) => {
+        try {
+          const response = await fetch(config.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              method: 'eth_sendRawTransaction',
+              params: [signedTx],
+              id: 1,
+            }),
+          });
+          const result = await response.json();
+          return result.result ? true : false;
+        } catch {
+          return false;
+        }
+      });
+      
+      const results = await Promise.all(batchPromises);
+      tokenSuccess += results.filter(r => r).length;
+      
+      process.stdout.write(`\r   Token distribution: ${i + batch.length}/${fundedSenders.length}`);
+    }
+    console.log();
+    
+    // Wait for token transfers
+    await sleep(2000);
+    console.log(`✅ Token distribution sent (${tokenSuccess} txs)`);
+  }
+  
+  // Approve router for swaps if needed
+  if (config.txMix.swap > 0 && contracts.router && fundedSenders.length > 0) {
+    console.log(`\n🔓 Approving router for all senders (for token->ETH swaps)...`);
+    
+    const iface = new ethers.Interface(ERC20_ABI);
+    const approvalAmount = ethers.MaxUint256;
+    
+    // Each sender approves the router
+    let approvalSuccess = 0;
+    const approvalBatchSize = 50;
+    
+    for (let i = 0; i < fundedSenders.length; i += approvalBatchSize) {
+      const batch = fundedSenders.slice(i, i + approvalBatchSize);
+      
+      const approvalPromises = batch.map(async (sender) => {
+        try {
+          const senderNonce = await sender.getNonce();
+          const data = iface.encodeFunctionData('approve', [contracts.router, approvalAmount]);
+          
+          const tx = {
+            to: contracts.token,
+            value: 0n,
+            data: data,
+            nonce: senderNonce,
+            gasLimit: 100000n,
+            chainId: chainId,
+            type: 2,
+            maxFeePerGas: maxFeePerGas,
+            maxPriorityFeePerGas: feeData.maxPriorityFeePerGas || 0n,
+          };
+          
+          const signedTx = await sender.signTransaction(tx);
+          
+          const response = await fetch(config.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              method: 'eth_sendRawTransaction',
+              params: [signedTx],
+              id: 1,
+            }),
+          });
+          const result = await response.json();
+          return result.result ? true : false;
+        } catch {
+          return false;
+        }
+      });
+      
+      const results = await Promise.all(approvalPromises);
+      approvalSuccess += results.filter(r => r).length;
+      
+      process.stdout.write(`\r   Approvals: ${i + batch.length}/${fundedSenders.length}`);
+    }
+    console.log();
+    
+    // Wait for approvals to confirm
+    await sleep(2000);
+    console.log(`✅ Router approvals sent (${approvalSuccess} txs)`);
+  }
   
   if (fundedSenders.length < count) {
     console.log(`   ⚠️  ${count - fundedSenders.length} accounts not funded (will use ${fundedSenders.length} senders)`);
@@ -228,106 +598,21 @@ async function createAndFundSenders(provider, funderWallet, count, fundingAmount
 }
 
 // =============================================================================
-// Transaction Preparation & Pre-signing
+// Transaction Preparation & Pre-signing (using payload-generator module)
 // =============================================================================
 
-async function prepareAndSignTransactions(senders, config, chainId, provider) {
-  console.log(`\n🔧 Preparing ${config.txCount} transactions...`);
+async function prepareAndSignTransactions(senders, config, chainId, provider, contracts) {
+  // Generate payload using the payload generator module
+  const { unsignedTxs, expectedTxDetails } = await generatePayload({
+    senders,
+    provider,
+    chainId,
+    config,
+    contracts,
+  });
   
-  const txPerSender = Math.ceil(config.txCount / senders.length);
-  
-  // Get nonces for all senders in parallel
-  const noncePromises = senders.map(s => s.getNonce());
-  const nonces = await Promise.all(noncePromises);
-  
-  // Get current fee data for gas pricing (add buffer for base fee fluctuations)
-  const feeData = await provider.getFeeData();
-  const multiplier = BigInt(Math.floor(config.gasMultiplier * 100));
-  const maxFeePerGas = (feeData.maxFeePerGas || feeData.gasPrice) * multiplier / 100n;
-  const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || 0n;
-  console.log(`   Gas price: ${ethers.formatUnits(feeData.gasPrice || 0n, 'gwei')} gwei (using ${config.gasMultiplier}x buffer)`);
-  
-  // Create a recipient address (just send to self for simplicity)
-  const recipient = ethers.Wallet.createRandom().address;
-  const txValue = ethers.parseEther(config.txValue);
-  
-  // Store expected tx details for later verification
-  const expectedTxDetails = {
-    recipient: recipient.toLowerCase(),
-    value: txValue,
-    senderAddresses: new Set(senders.map(s => s.address.toLowerCase())),
-  };
-  
-  console.log(`   Recipient: ${recipient}`);
-  console.log(`   Value per tx: ${config.txValue} ETH`);
-  
-  // Build all unsigned transactions
-  const unsignedTxs = [];
-  let txIndex = 0;
-  
-  for (let senderIdx = 0; senderIdx < senders.length && txIndex < config.txCount; senderIdx++) {
-    const sender = senders[senderIdx];
-    let nonce = nonces[senderIdx];
-    
-    const txsForThisSender = Math.min(txPerSender, config.txCount - txIndex);
-    
-    for (let i = 0; i < txsForThisSender && txIndex < config.txCount; i++) {
-      const tx = {
-        to: recipient,
-        value: txValue,
-        nonce: nonce++,
-        gasLimit: config.gasLimit,
-        chainId: chainId,
-        type: 2, // EIP-1559 transaction
-        maxFeePerGas: maxFeePerGas,
-        maxPriorityFeePerGas: maxPriorityFeePerGas,
-      };
-      
-      unsignedTxs.push({
-        sender,
-        tx,
-        index: txIndex++,
-      });
-    }
-  }
-  
-  console.log(`✅ Prepared ${unsignedTxs.length} transactions across ${senders.length} senders`);
-  
-  // Pre-sign all transactions
-  console.log(`\n✍️  Pre-signing ${unsignedTxs.length} transactions...`);
-  const signStartTime = Date.now();
-  
-  const signedTxs = [];
-  const signBatchSize = 100;
-  
-  for (let i = 0; i < unsignedTxs.length; i += signBatchSize) {
-    const batch = unsignedTxs.slice(i, i + signBatchSize);
-    
-    const signPromises = batch.map(async ({ sender, tx, index }) => {
-      try {
-        const signedTx = await sender.signTransaction(tx);
-        return { signedTx, index, expectedFrom: sender.address.toLowerCase() };
-      } catch (err) {
-        console.error(`\n   Failed to sign tx ${index}: ${err.message}`);
-        return null;
-      }
-    });
-    
-    const results = await Promise.all(signPromises);
-    
-    for (const result of results) {
-      if (result) signedTxs.push(result);
-    }
-    
-    // Progress update
-    const progress = Math.min(i + signBatchSize, unsignedTxs.length);
-    const elapsed = Date.now() - signStartTime;
-    const rate = (progress / elapsed) * 1000;
-    process.stdout.write(`\r   Signed: ${progress}/${unsignedTxs.length} (${rate.toFixed(0)} tx/s)`);
-  }
-  
-  const signDuration = Date.now() - signStartTime;
-  console.log(`\n✅ Pre-signed ${signedTxs.length} transactions in ${formatDuration(signDuration)}`);
+  // Sign transactions using the payload generator module
+  const { signedTxs, signDuration } = await signTransactions(unsignedTxs, formatDuration);
   
   return { signedTxs, signDuration, expectedTxDetails };
 }
@@ -339,6 +624,7 @@ async function prepareAndSignTransactions(senders, config, chainId, provider) {
 async function fireAndForgetBroadcast(signedTxs, config) {
   console.log(`\n🚀 Broadcasting ${signedTxs.length} transactions...`);
   console.log(`   Concurrency: ${config.concurrentRequests} parallel requests`);
+  console.log(`   Mix: ${config.txMix.ethTransfer}% ETH | ${config.txMix.tokenTransfer}% Token | ${config.txMix.swap}% Swap`);
   
   const startTime = Date.now();
   let successCount = 0;
@@ -367,6 +653,7 @@ async function fireAndForgetBroadcast(signedTxs, config) {
     if (msg.includes('intrinsic gas too low')) return 'gas_too_low';
     if (msg.includes('timeout') || msg.includes('ETIMEDOUT')) return 'timeout';
     if (msg.includes('connection') || msg.includes('ECONNREFUSED')) return 'connection_error';
+    if (msg.includes('execution reverted')) return 'execution_reverted';
     return 'other';
   };
   
@@ -374,7 +661,7 @@ async function fireAndForgetBroadcast(signedTxs, config) {
   const worker = async () => {
     while (nextIndex < signedTxs.length) {
       const idx = nextIndex++;
-      const { signedTx, index, expectedFrom } = signedTxs[idx];
+      const { signedTx, index, expectedFrom, txType } = signedTxs[idx];
       
       try {
         const response = await fetch(config.rpcUrl, {
@@ -391,40 +678,34 @@ async function fireAndForgetBroadcast(signedTxs, config) {
         const result = await response.json();
         
         if (result.result) {
-          txHashes.push({ hash: result.result, index, expectedFrom });
           successCount++;
+          txHashes.push({ hash: result.result, index, expectedFrom, txType });
         } else {
-          const errorMsg = result.error?.message || 'unknown error';
-          if (!firstError) firstError = errorMsg;
-          
-          // Categorize and count error
+          errorCount++;
+          const errorMsg = result.error?.message || 'Unknown error';
           const errorType = categorizeError(errorMsg);
           errorTypes.set(errorType, (errorTypes.get(errorType) || 0) + 1);
+          
           if (!errorExamples.has(errorType)) {
-            errorExamples.set(errorType, errorMsg.slice(0, 100));
+            errorExamples.set(errorType, errorMsg);
           }
           
-          errorCount++;
+          if (!firstError) firstError = errorMsg;
         }
       } catch (err) {
-        const errorMsg = err.message || 'unknown error';
-        if (!firstError) firstError = errorMsg;
-        
-        const errorType = categorizeError(errorMsg);
-        errorTypes.set(errorType, (errorTypes.get(errorType) || 0) + 1);
-        if (!errorExamples.has(errorType)) {
-          errorExamples.set(errorType, errorMsg.slice(0, 100));
-        }
-        
         errorCount++;
+        const errorType = categorizeError(err.message);
+        errorTypes.set(errorType, (errorTypes.get(errorType) || 0) + 1);
+        
+        if (!firstError) firstError = err.message;
       }
       
       // Progress update
       const total = successCount + errorCount;
-      if (total % 200 === 0 || total === signedTxs.length) {
+      if (total % 100 === 0 || total === signedTxs.length) {
         const elapsed = Date.now() - startTime;
         const rate = (total / elapsed) * 1000;
-        process.stdout.write(`\r   Sent: ${total}/${signedTxs.length} (${rate.toFixed(0)} tx/s) | ✓${successCount} ✗${errorCount}`);
+        process.stdout.write(`\r   Progress: ${total}/${signedTxs.length} (✓${successCount} ✗${errorCount}) ${rate.toFixed(0)} tx/s`);
       }
     }
   };
@@ -435,462 +716,203 @@ async function fireAndForgetBroadcast(signedTxs, config) {
     workers.push(worker());
   }
   
+  // Wait for all workers to complete
   await Promise.all(workers);
   
-  const sendDuration = Date.now() - startTime;
-  const finalRate = (signedTxs.length / sendDuration) * 1000;
+  const endTime = Date.now();
+  const totalTime = endTime - startTime;
   
-  console.log(`\n✅ Broadcast complete in ${formatDuration(sendDuration)} (${finalRate.toFixed(0)} tx/s)`);
-  console.log(`   Successful: ${successCount} | Failed: ${errorCount}`);
+  console.log(`\n✅ Broadcast complete in ${formatDuration(totalTime)}`);
+  console.log(`   Success: ${successCount}, Failed: ${errorCount}`);
   
-  if (errorCount > 0) {
-    console.log(`\n   📊 ERROR BREAKDOWN:`);
-    
-    // Sort errors by count (descending)
-    const sortedErrors = [...errorTypes.entries()].sort((a, b) => b[1] - a[1]);
-    
-    for (const [errorType, count] of sortedErrors) {
-      const percentage = ((count / errorCount) * 100).toFixed(1);
-      const example = errorExamples.get(errorType);
-      
-      const friendlyName = {
-        'gas_price_too_low': '⛽ Gas price too low (base fee increased)',
-        'nonce_too_low': '🔢 Nonce too low',
-        'nonce_too_high': '🔢 Nonce too high',
-        'already_known': '📋 Already known (duplicate)',
-        'replacement_underpriced': '💰 Replacement underpriced',
-        'insufficient_funds': '💸 Insufficient funds',
-        'gas_too_low': '⛽ Gas limit too low',
-        'timeout': '⏱️  Timeout',
-        'connection_error': '🔌 Connection error',
-        'other': '❓ Other',
-        'unknown': '❓ Unknown',
-      }[errorType] || errorType;
-      
-      console.log(`   ${friendlyName}: ${count} (${percentage}%)`);
-    }
-    
-    if (firstError) {
-      console.log(`\n   First error example: ${firstError.slice(0, 120)}`);
-    }
+  if (firstError) {
+    console.log(`   First error: ${firstError.substring(0, 100)}...`);
   }
   
-  return { txHashes, errors: [], sendDuration, successCount, errorCount, errorTypes: Object.fromEntries(errorTypes) };
+  // Convert errorTypes Map to object for return
+  const errorTypesObj = {};
+  for (const [type, count] of errorTypes) {
+    errorTypesObj[type] = count;
+  }
+  
+  return {
+    txHashes,
+    successCount,
+    errorCount,
+    firstError,
+    broadcastDuration: totalTime,
+    errorTypes: errorTypesObj,
+  };
 }
 
 // =============================================================================
-// Wait for Confirmations
+// Confirmation Tracking
 // =============================================================================
 
-async function waitForConfirmations(provider, txHashes, timeoutMs = 120000) {
-  console.log(`\n⏳ Waiting for ${txHashes.length} transactions to be mined...`);
+async function waitForConfirmations(provider, txHashes, timeoutMs = 60000) {
+  console.log(`\n⏳ Waiting for ${txHashes.length} transactions to confirm...`);
   
   const startTime = Date.now();
   const receipts = [];
-  const failed = [];
-  
-  // Poll for receipts with progress updates
   const pending = new Set(txHashes.map(t => t.hash));
   
   while (pending.size > 0 && Date.now() - startTime < timeoutMs) {
-    const checkPromises = Array.from(pending).map(async (hash) => {
+    const checkBatch = Array.from(pending).slice(0, 100);
+    
+    const receiptPromises = checkBatch.map(async (hash) => {
       try {
         const receipt = await provider.getTransactionReceipt(hash);
         if (receipt) {
-          return { hash, receipt };
+          pending.delete(hash);
+          return receipt;
         }
-      } catch (err) {
-        // Ignore and retry
+      } catch {
+        // Ignore errors, will retry
       }
       return null;
     });
     
-    const results = await Promise.all(checkPromises);
+    const batchReceipts = await Promise.all(receiptPromises);
     
-    for (const result of results) {
-      if (result) {
-        pending.delete(result.hash);
-        receipts.push(result.receipt);
-      }
+    for (const receipt of batchReceipts) {
+      if (receipt) receipts.push(receipt);
     }
     
-    const confirmed = receipts.length;
-    const elapsed = Date.now() - startTime;
-    process.stdout.write(`\r   Confirmed: ${confirmed}/${txHashes.length} (${formatDuration(elapsed)} elapsed)`);
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    process.stdout.write(`\r   Confirmed: ${receipts.length}/${txHashes.length} (${elapsed}s)`);
     
     if (pending.size > 0) {
-      await sleep(100); // Poll every 100ms
+      await sleep(500);
     }
   }
   
   const confirmDuration = Date.now() - startTime;
-  console.log(`\n✅ Confirmed ${receipts.length} transactions in ${formatDuration(confirmDuration)}`);
-  
-  if (pending.size > 0) {
-    console.log(`⚠️  ${pending.size} transactions not confirmed within timeout`);
-  }
+  console.log(`\n✅ Confirmed ${receipts.length}/${txHashes.length} in ${formatDuration(confirmDuration)}`);
   
   return { receipts, confirmDuration };
 }
 
 // =============================================================================
-// TPS Analysis (with verification)
+// TPS Analysis (Block-based)
 // =============================================================================
 
 async function analyzeBlockTPS(provider, receipts, broadcastStartTime, broadcastEndTime, expectedTxDetails, txHashesWithMeta, config) {
-  console.log(`\n📊 Analyzing TPS from chain history...`);
-  
   if (receipts.length === 0) {
-    console.log('❌ No receipts to analyze');
+    console.log('⚠️  No receipts to analyze');
     return null;
   }
   
-  // Check receipt statuses (1 = success, 0 = reverted)
-  let successfulTxCount = 0;
-  let revertedTxCount = 0;
+  console.log(`\n📊 Analyzing on-chain TPS...`);
   
-  for (const receipt of receipts) {
-    if (receipt.status === 1) {
-      successfulTxCount++;
-    } else {
-      revertedTxCount++;
-    }
-  }
-  
-  console.log(`   Receipt status check: ✓${successfulTxCount} successful, ✗${revertedTxCount} reverted`);
-  
-  // Get unique block numbers
+  // Find block range from receipts
   const blockNumbers = [...new Set(receipts.map(r => r.blockNumber))].sort((a, b) => a - b);
+  const firstBlock = Math.min(...blockNumbers);
+  const lastBlock = Math.max(...blockNumbers);
   
-  console.log(`   Transactions spread across ${blockNumbers.length} blocks (${blockNumbers[0]} - ${blockNumbers[blockNumbers.length - 1]})`);
+  console.log(`   Block range: ${firstBlock} - ${lastBlock} (${blockNumbers.length} blocks)`);
   
-  // Fetch all blocks (without full tx data to avoid "response too large" errors)
-  console.log(`   Fetching ${blockNumbers.length} blocks...`);
-  const blockPromises = blockNumbers.map(num => provider.getBlock(num, false)); // false = tx hashes only
+  // Fetch blocks (without full transaction data to avoid "response too large")
+  const blockPromises = [];
+  for (let i = firstBlock; i <= lastBlock; i++) {
+    blockPromises.push(provider.getBlock(i, false));
+  }
   const blocks = await Promise.all(blockPromises);
   
-  // Build maps for verification
-  const ourTxHashes = new Set(receipts.map(r => r.hash.toLowerCase()));
-  const successfulTxHashes = new Set(receipts.filter(r => r.status === 1).map(r => r.hash.toLowerCase()));
-  
-  // Map of hash -> expected from address
-  const hashToExpectedFrom = new Map();
-  for (const item of txHashesWithMeta) {
-    hashToExpectedFrom.set(item.hash.toLowerCase(), item.expectedFrom);
+  // Build transaction hash to metadata map
+  const txHashToMeta = new Map();
+  for (const { hash, index, expectedFrom, txType } of txHashesWithMeta) {
+    txHashToMeta.set(hash.toLowerCase(), { index, expectedFrom, txType });
   }
   
-  // Count our transactions per block (from receipts)
-  const txCountByBlock = new Map();
-  for (const receipt of receipts) {
-    const count = txCountByBlock.get(receipt.blockNumber) || 0;
-    txCountByBlock.set(receipt.blockNumber, count + 1);
-  }
-  
-  // VERIFICATION: Check our tx hashes exist in blocks
-  console.log(`\n🔍 VERIFICATION (checking tx hashes in blocks)...`);
-  
+  // Analyze blocks
+  const blockStats = [];
+  let totalBlockTxCount = 0;
+  let ourTxCount = 0;
   let verifiedTxCount = 0;
   let verifiedSuccessfulCount = 0;
-  let totalBlockTxCount = 0;
+  let revertedTxCount = 0;
+  
+  // Track tx types in verified
+  const verifiedByType = { eth_transfer: 0, token_transfer: 0, swap: 0 };
   
   for (const block of blocks) {
-    totalBlockTxCount += block.transactions.length;
+    if (!block) continue;
     
-    // Check each transaction hash in the block
-    for (const txHash of block.transactions) {
-      const hash = txHash.toLowerCase();
-      
-      if (ourTxHashes.has(hash)) {
-        verifiedTxCount++;
-        if (successfulTxHashes.has(hash)) {
-          verifiedSuccessfulCount++;
+    const txHashes = block.transactions || [];
+    totalBlockTxCount += txHashes.length;
+    
+    let blockOurTxCount = 0;
+    
+    for (const hash of txHashes) {
+      const hashLower = hash.toLowerCase();
+      if (txHashToMeta.has(hashLower)) {
+        blockOurTxCount++;
+        ourTxCount++;
+        
+        const meta = txHashToMeta.get(hashLower);
+        const receipt = receipts.find(r => r.hash.toLowerCase() === hashLower);
+        
+        if (receipt) {
+          verifiedTxCount++;
+          if (receipt.status === 1) {
+            verifiedSuccessfulCount++;
+            if (meta.txType) {
+              verifiedByType[meta.txType] = (verifiedByType[meta.txType] || 0) + 1;
+            }
+          } else {
+            revertedTxCount++;
+          }
         }
       }
     }
-  }
-  
-  console.log(`   ✓ Hash found on-chain:      ${verifiedTxCount}/${receipts.length}`);
-  console.log(`   ✓ CONFIRMED (status=1):     ${verifiedSuccessfulCount}`);
-  console.log(`   ✓ Total txs in blocks:      ${totalBlockTxCount}`);
-  
-  // EXPLICIT SAMPLE VERIFICATION: Fetch random transactions directly
-  console.log(`\n🔬 EXPLICIT SAMPLE VERIFICATION (fetching txs directly from chain)...`);
-  const sampleSize = Math.min(10, receipts.length);
-  const sampleIndices = [];
-  
-  // Pick random samples spread across the receipts
-  for (let i = 0; i < sampleSize; i++) {
-    sampleIndices.push(Math.floor((i / sampleSize) * receipts.length));
-  }
-  
-  let sampleVerified = 0;
-  const sampleResults = [];
-  
-  for (const idx of sampleIndices) {
-    const receipt = receipts[idx];
-    try {
-      // Fetch transaction directly by hash
-      const tx = await provider.getTransaction(receipt.hash);
-      const txReceipt = await provider.getTransactionReceipt(receipt.hash);
-      
-      if (tx && txReceipt) {
-        const fromMatch = expectedTxDetails.senderAddresses.has(tx.from.toLowerCase());
-        const toMatch = tx.to?.toLowerCase() === expectedTxDetails.recipient;
-        const valueMatch = tx.value === expectedTxDetails.value;
-        const statusOk = txReceipt.status === 1;
-        const blockConfirmed = txReceipt.blockNumber > 0;
-        
-        if (fromMatch && toMatch && valueMatch && statusOk && blockConfirmed) {
-          sampleVerified++;
-          sampleResults.push({
-            hash: receipt.hash.slice(0, 18) + '...',
-            from: tx.from.slice(0, 10) + '...',
-            to: tx.to.slice(0, 10) + '...',
-            value: ethers.formatEther(tx.value),
-            block: txReceipt.blockNumber,
-            status: '✓',
-          });
-        } else {
-          sampleResults.push({
-            hash: receipt.hash.slice(0, 18) + '...',
-            status: '✗',
-            reason: !fromMatch ? 'from' : !toMatch ? 'to' : !valueMatch ? 'value' : !statusOk ? 'status' : 'block',
-          });
-        }
-      } else {
-        sampleResults.push({
-          hash: receipt.hash.slice(0, 18) + '...',
-          status: '✗',
-          reason: 'not found',
-        });
-      }
-    } catch (err) {
-      sampleResults.push({
-        hash: receipt.hash.slice(0, 18) + '...',
-        status: '✗',
-        reason: err.message,
-      });
-    }
-  }
-  
-  console.log(`   Sample: ${sampleVerified}/${sampleSize} transactions verified by direct fetch`);
-  console.log(`\n   📋 Sample transaction details:`);
-  console.log(`   ${'─'.repeat(75)}`);
-  console.log(`   Hash               | From         | To           | Value    | Block  | OK`);
-  console.log(`   ${'─'.repeat(75)}`);
-  
-  for (const r of sampleResults) {
-    if (r.status === '✓') {
-      console.log(`   ${r.hash} | ${r.from} | ${r.to} | ${r.value.padStart(8)} | ${r.block.toString().padStart(6)} | ${r.status}`);
-    } else {
-      console.log(`   ${r.hash} | FAILED: ${r.reason}`);
-    }
-  }
-  console.log(`   ${'─'.repeat(75)}`);
-  
-  // FULL VERIFICATION: If --verifyAll is set, verify EVERY transaction individually using worker pool
-  let fullVerifiedCount = verifiedTxCount; // Default to block-based verification
-  
-  if (config.verifyAll) {
-    console.log(`\n🔬 FULL VERIFICATION: Fetching ALL ${receipts.length} transactions by hash...`);
-    console.log(`   Checking each tx: hash exists → receipt exists → status=1 → block mined → data matches`);
-    console.log(`   Using worker pool with ${config.concurrentRequests} concurrent requests...`);
-    
-    fullVerifiedCount = 0;
-    let fullVerifyErrors = 0;
-    let notFound = 0;
-    let noReceipt = 0;
-    let statusFailed = 0;
-    let notMined = 0;
-    let dataMismatch = 0;
-    let errorCount = 0;
-    
-    // Worker pool pattern for parallel verification
-    let nextIndex = 0;
-    const startTime = Date.now();
-    
-    const verifyWorker = async () => {
-      while (nextIndex < receipts.length) {
-        const idx = nextIndex++;
-        const receipt = receipts[idx];
-        
-        try {
-          // 1. Fetch transaction by hash
-          const tx = await provider.getTransaction(receipt.hash);
-          if (!tx) {
-            notFound++;
-            fullVerifyErrors++;
-            continue;
-          }
-          
-          // 2. Fetch receipt by hash
-          const txReceipt = await provider.getTransactionReceipt(receipt.hash);
-          if (!txReceipt) {
-            noReceipt++;
-            fullVerifyErrors++;
-            continue;
-          }
-          
-          // 3. Check receipt status (1 = success, 0 = reverted)
-          if (txReceipt.status !== 1) {
-            statusFailed++;
-            fullVerifyErrors++;
-            continue;
-          }
-          
-          // 4. Check it's actually mined in a block
-          if (!txReceipt.blockNumber || txReceipt.blockNumber <= 0) {
-            notMined++;
-            fullVerifyErrors++;
-            continue;
-          }
-          
-          // 5. Verify transaction data matches what we sent
-          const fromOk = expectedTxDetails.senderAddresses.has(tx.from.toLowerCase());
-          const toOk = tx.to?.toLowerCase() === expectedTxDetails.recipient;
-          const valueOk = tx.value === expectedTxDetails.value;
-          
-          if (!fromOk || !toOk || !valueOk) {
-            dataMismatch++;
-            fullVerifyErrors++;
-            continue;
-          }
-          
-          // ALL CHECKS PASSED
-          fullVerifiedCount++;
-        } catch (err) {
-          errorCount++;
-          fullVerifyErrors++;
-        }
-        
-        // Progress update every 100 txs
-        const completed = fullVerifiedCount + fullVerifyErrors;
-        if (completed % 100 === 0 || completed === receipts.length) {
-          const elapsed = Date.now() - startTime;
-          const rate = (completed / elapsed) * 1000;
-          process.stdout.write(`\r   Verified: ${completed}/${receipts.length} (${rate.toFixed(0)}/s) | ✓${fullVerifiedCount} | ✗${fullVerifyErrors}`);
-        }
-      }
-    };
-    
-    // Start worker pool
-    const workers = [];
-    const workerCount = Math.min(config.concurrentRequests, receipts.length);
-    for (let i = 0; i < workerCount; i++) {
-      workers.push(verifyWorker());
-    }
-    
-    await Promise.all(workers);
-    
-    const verifyDuration = Date.now() - startTime;
-    const verifyRate = (receipts.length / verifyDuration) * 1000;
-    
-    console.log(`\n\n   📊 FULL VERIFICATION RESULTS:`);
-    console.log(`   ✅ Fully verified & confirmed: ${fullVerifiedCount}/${receipts.length}`);
-    console.log(`   ⏱️  Verification time: ${(verifyDuration / 1000).toFixed(2)}s (${verifyRate.toFixed(0)} tx/s)`);
-    
-    if (fullVerifyErrors > 0) {
-      console.log(`   ❌ Failed verifications: ${fullVerifyErrors}`);
-      if (notFound > 0) console.log(`      - TX not found by hash: ${notFound}`);
-      if (noReceipt > 0) console.log(`      - No receipt found: ${noReceipt}`);
-      if (statusFailed > 0) console.log(`      - Receipt status=0 (reverted): ${statusFailed}`);
-      if (notMined > 0) console.log(`      - Not mined in block: ${notMined}`);
-      if (dataMismatch > 0) console.log(`      - Data mismatch (from/to/value): ${dataMismatch}`);
-      if (errorCount > 0) console.log(`      - RPC errors: ${errorCount}`);
-    }
-    
-    // Update verified counts with full verification results
-    verifiedTxCount = fullVerifiedCount;
-    verifiedSuccessfulCount = fullVerifiedCount;
-  }
-  
-  // Calculate block-by-block statistics
-  const blockStats = [];
-  for (let i = 0; i < blocks.length; i++) {
-    const block = blocks[i];
-    const ourTxCount = txCountByBlock.get(block.number) || 0;
     
     blockStats.push({
       number: block.number,
       timestamp: block.timestamp,
-      totalTxCount: block.transactions.length,
-      ourTxCount,
+      totalTxCount: txHashes.length,
+      ourTxCount: blockOurTxCount,
       gasUsed: block.gasUsed,
-      gasLimit: block.gasLimit,
     });
   }
   
-  // Calculate time span from block timestamps
-  const firstBlock = blocks[0];
-  const lastBlock = blocks[blocks.length - 1];
-  const blockTimeSpanSeconds = Number(lastBlock.timestamp - firstBlock.timestamp);
-  
-  // Calculate time span from our actual broadcast timing (more accurate)
-  const actualTimeSpanMs = broadcastEndTime - broadcastStartTime;
-  const actualTimeSpanSeconds = actualTimeSpanMs / 1000;
-  
-  // TPS calculations
-  // Method 1: Based on block timestamps (coarse - second precision only)
-  let blockBasedTps = 0;
-  let confirmedBlockTps = 0;
-  if (blockTimeSpanSeconds > 0) {
-    blockBasedTps = verifiedTxCount / blockTimeSpanSeconds;
-    confirmedBlockTps = verifiedSuccessfulCount / blockTimeSpanSeconds;
-  } else {
-    // All same timestamp - estimate using block count and avg block time
-    const estimatedTime = blockNumbers.length * 0.25; // 250ms per block
-    blockBasedTps = verifiedTxCount / estimatedTime;
-    confirmedBlockTps = verifiedSuccessfulCount / estimatedTime;
-  }
-  
-  // Method 2: Based on actual broadcast duration (our timing)
-  const broadcastTps = verifiedTxCount / actualTimeSpanSeconds;
-  const confirmedBroadcastTps = verifiedSuccessfulCount / actualTimeSpanSeconds;
+  // Calculate TPS metrics
+  const firstBlockData = blockStats[0];
+  const lastBlockData = blockStats[blockStats.length - 1];
+  const blockTimeSpanSeconds = lastBlockData.timestamp - firstBlockData.timestamp || 1;
+  const actualTimeSpanSeconds = (broadcastEndTime - broadcastStartTime) / 1000;
   
   // Find peak block
-  const peakBlock = blockStats.reduce((max, b) => 
-    b.totalTxCount > max.totalTxCount ? b : max, blockStats[0]);
+  const peakBlock = blockStats.reduce((max, block) => 
+    block.ourTxCount > max.ourTxCount ? block : max, blockStats[0]);
   
-  // Calculate average block time
-  let avgBlockTime = 0;
-  if (blocks.length > 1) {
-    const blockTimes = [];
-    for (let i = 1; i < blocks.length; i++) {
-      const diff = Number(blocks[i].timestamp - blocks[i-1].timestamp);
-      blockTimes.push(diff);
-    }
-    avgBlockTime = blockTimes.reduce((a, b) => a + b, 0) / blockTimes.length;
-  }
-  
-  // Estimate more accurate time using block count
-  const estimatedActualTimeSeconds = blockNumbers.length > 1 
-    ? (blockNumbers.length - 1) * avgBlockTime + 0.5 // Add half block for first/last
-    : 0.25;
-  
-  const estimatedTps = blockTimeSpanSeconds > 0 
-    ? verifiedTxCount / Math.max(blockTimeSpanSeconds, estimatedActualTimeSeconds)
-    : verifiedTxCount / estimatedActualTimeSeconds;
+  // TPS calculations
+  const blockBasedTps = verifiedTxCount / blockTimeSpanSeconds;
+  const broadcastTps = verifiedTxCount / actualTimeSpanSeconds;
+  const confirmedBlockTps = verifiedSuccessfulCount / blockTimeSpanSeconds;
+  const confirmedBroadcastTps = verifiedSuccessfulCount / actualTimeSpanSeconds;
   
   return {
-    blockCount: blockNumbers.length,
-    firstBlock: firstBlock.number,
-    lastBlock: lastBlock.number,
+    blockCount: blockStats.length,
+    firstBlock,
+    lastBlock,
     blockTimeSpanSeconds,
     actualTimeSpanSeconds,
-    receiptsCount: receipts.length,
+    avgBlockTime: blockTimeSpanSeconds / Math.max(1, blockStats.length - 1),
+    totalBlockTxCount,
+    ourTxCount,
     verifiedTxCount,
     verifiedSuccessfulCount,
     revertedTxCount,
-    totalBlockTxCount,
+    receiptsCount: receipts.length,
+    sampleVerified: Math.min(10, verifiedTxCount),
+    sampleSize: Math.min(10, verifiedTxCount),
     blockBasedTps,
-    confirmedBlockTps,
     broadcastTps,
+    confirmedBlockTps,
     confirmedBroadcastTps,
     peakBlock,
-    avgBlockTime,
     blockStats,
-    sampleVerified,
-    sampleSize,
+    verifiedByType,
   };
 }
 
@@ -899,32 +921,31 @@ async function analyzeBlockTPS(provider, receipts, broadcastStartTime, broadcast
 // =============================================================================
 
 function generateReport(config, sendResult, confirmResult, tpsAnalysis) {
-  console.log('\n' + '='.repeat(70));
-  console.log('                    TPS BATTLE TEST REPORT');
-  console.log('='.repeat(70));
+  ui.printSection('Test Report', '📊');
   
-  console.log('\n📋 TEST CONFIGURATION:');
-  console.log(`   • Total transactions:    ${config.txCount}`);
-  console.log(`   • Sender accounts:       ${config.senderCount}`);
-  console.log(`   • Concurrent requests:   ${config.concurrentRequests}`);
-  console.log(`   • RPC URL:               ${config.rpcUrl}`);
+  // Configuration
+  ui.printSubSection('Configuration');
+  ui.printStats({
+    'Transaction count': ui.formatNumber(config.txCount),
+    'Sender accounts': config.senderCount,
+    'Concurrent requests': config.concurrentRequests,
+    'Gas multiplier': `${config.gasMultiplier}x`,
+    'Transaction mix': `${config.txMix.ethTransfer}% ETH │ ${config.txMix.tokenTransfer}% Token │ ${config.txMix.swap}% Swap`,
+  });
   
-  console.log('\n✍️  SIGNING METRICS:');
-  if (sendResult.signDuration) {
-    console.log(`   • Signing time:          ${formatDuration(sendResult.signDuration)}`);
-    console.log(`   • Signing rate:          ${(sendResult.txHashes.length / sendResult.signDuration * 1000).toFixed(1)} tx/s`);
-  }
+  // Broadcast metrics
+  ui.printSubSection('Broadcast Metrics');
+  const broadcastRate = (sendResult.successCount / (sendResult.broadcastDuration / 1000)).toFixed(2);
+  ui.printStats({
+    'Signing time': sendResult.signDuration ? ui.formatDuration(sendResult.signDuration) : 'N/A',
+    'Broadcast success': ui.style.success(sendResult.successCount),
+    'Broadcast failed': sendResult.errorCount > 0 ? ui.style.error(sendResult.errorCount) : '0',
+    'Broadcast time': ui.formatDuration(sendResult.broadcastDuration),
+    'Broadcast rate': `${broadcastRate} tx/s`,
+  });
   
-  console.log('\n📤 BROADCAST METRICS:');
-  const totalSent = sendResult.successCount || sendResult.txHashes.length;
-  const totalFailed = sendResult.errorCount || sendResult.errors.length;
-  console.log(`   • Transactions sent:     ${totalSent}`);
-  console.log(`   • Send failures:         ${totalFailed}`);
-  console.log(`   • Broadcast time:        ${formatDuration(sendResult.sendDuration)}`);
-  console.log(`   • Broadcast rate:        ${((totalSent + totalFailed) / sendResult.sendDuration * 1000).toFixed(1)} tx/s`);
-  
-  if (totalFailed > 0 && sendResult.errorTypes) {
-    console.log(`   • Error breakdown:`);
+  if (Object.keys(sendResult.errorTypes).length > 0) {
+    console.log(`\n   ${ui.colors.dim}Error breakdown:${ui.colors.reset}`);
     const errorLabels = {
       'gas_price_too_low': 'Gas price too low',
       'nonce_too_low': 'Nonce too low',
@@ -935,66 +956,81 @@ function generateReport(config, sendResult, confirmResult, tpsAnalysis) {
       'gas_too_low': 'Gas limit too low',
       'timeout': 'Timeout',
       'connection_error': 'Connection error',
+      'execution_reverted': 'Execution reverted',
       'other': 'Other',
       'unknown': 'Unknown',
     };
     for (const [type, count] of Object.entries(sendResult.errorTypes)) {
-      console.log(`     - ${errorLabels[type] || type}: ${count}`);
+      console.log(`     ${ui.colors.dim}•${ui.colors.reset} ${errorLabels[type] || type}: ${ui.style.warning(count)}`);
     }
   }
   
-  console.log('\n✅ CONFIRMATION METRICS:');
-  console.log(`   • Transactions confirmed: ${confirmResult.receipts.length}`);
-  console.log(`   • Confirmation time:      ${formatDuration(confirmResult.confirmDuration)}`);
+  // Confirmation metrics
+  ui.printSubSection('Confirmation Metrics');
+  ui.printStats({
+    'Transactions confirmed': ui.style.success(confirmResult.receipts.length),
+    'Confirmation time': ui.formatDuration(confirmResult.confirmDuration),
+  });
   
   if (tpsAnalysis) {
-    console.log('\n📊 DEEP ON-CHAIN VERIFICATION:');
-    console.log(`   • Blocks used:              ${tpsAnalysis.blockCount} (${tpsAnalysis.firstBlock} - ${tpsAnalysis.lastBlock})`);
-    console.log(`   • Block timestamp span:     ${tpsAnalysis.blockTimeSpanSeconds}s (coarse - second precision)`);
-    console.log(`   • Actual broadcast time:    ${tpsAnalysis.actualTimeSpanSeconds.toFixed(2)}s`);
-    console.log(`   • Avg block time:           ${tpsAnalysis.avgBlockTime.toFixed(3)}s`);
-    console.log(`   • Receipts received:        ${tpsAnalysis.receiptsCount}`);
-    console.log(`   • DEEP VERIFIED (data ok):  ${tpsAnalysis.verifiedTxCount}`);
-    console.log(`   • Sample direct fetch:      ${tpsAnalysis.sampleVerified}/${tpsAnalysis.sampleSize} ✓`);
-    console.log(`   • CONFIRMED (status=1):     ${tpsAnalysis.verifiedSuccessfulCount}`);
-    console.log(`   • REVERTED (status=0):      ${tpsAnalysis.revertedTxCount}`);
-    console.log(`   • Total txs in blocks:      ${tpsAnalysis.totalBlockTxCount}`);
+    // On-chain verification
+    ui.printSubSection('On-Chain Verification');
+    ui.printStats({
+      'Blocks used': `${tpsAnalysis.blockCount} (${tpsAnalysis.firstBlock} → ${tpsAnalysis.lastBlock})`,
+      'Block timestamp span': `${tpsAnalysis.blockTimeSpanSeconds}s`,
+      'Actual broadcast time': `${tpsAnalysis.actualTimeSpanSeconds.toFixed(2)}s`,
+      'Avg block time': `${tpsAnalysis.avgBlockTime.toFixed(3)}s`,
+      'Verified on-chain': ui.style.value(tpsAnalysis.verifiedTxCount),
+      'Confirmed (status=1)': ui.style.success(tpsAnalysis.verifiedSuccessfulCount),
+      'Reverted (status=0)': tpsAnalysis.revertedTxCount > 0 ? ui.style.error(tpsAnalysis.revertedTxCount) : '0',
+    });
     
-    console.log('\n🏆 TPS RESULTS:');
-    console.log(`   ┌─────────────────────────────────────────────────────────────┐`);
-    console.log(`   │                                                             │`);
-    console.log(`   │  📍 INCLUDED TPS (on-chain, any status):                    │`);
-    console.log(`   │     Block-timestamp:    ${tpsAnalysis.blockBasedTps.toFixed(2).padStart(10)} tx/s                  │`);
-    console.log(`   │     Broadcast-duration: ${tpsAnalysis.broadcastTps.toFixed(2).padStart(10)} tx/s                  │`);
-    console.log(`   │                                                             │`);
-    console.log(`   │  ✅ CONFIRMED TPS (status=1, successful execution):         │`);
-    console.log(`   │     Block-timestamp:    ${tpsAnalysis.confirmedBlockTps.toFixed(2).padStart(10)} tx/s                  │`);
-    console.log(`   │     Broadcast-duration: ${tpsAnalysis.confirmedBroadcastTps.toFixed(2).padStart(10)} tx/s                  │`);
-    console.log(`   │                                                             │`);
-    console.log(`   └─────────────────────────────────────────────────────────────┘`);
+    // Breakdown by type if mixed
+    if (config.txMix.tokenTransfer > 0 || config.txMix.swap > 0) {
+      console.log(`\n   ${ui.colors.dim}By transaction type:${ui.colors.reset}`);
+      console.log(`     ${ui.colors.dim}•${ui.colors.reset} ETH transfers:   ${ui.style.value(tpsAnalysis.verifiedByType.eth_transfer || 0)}`);
+      console.log(`     ${ui.colors.dim}•${ui.colors.reset} Token transfers: ${ui.style.value(tpsAnalysis.verifiedByType.token_transfer || 0)}`);
+      console.log(`     ${ui.colors.dim}•${ui.colors.reset} Swaps:           ${ui.style.value(tpsAnalysis.verifiedByType.swap || 0)}`);
+    }
+    
+    // TPS Results Box
+    ui.printTPSResults(
+      { blockTps: tpsAnalysis.blockBasedTps, broadcastTps: tpsAnalysis.broadcastTps },
+      { blockTps: tpsAnalysis.confirmedBlockTps, broadcastTps: tpsAnalysis.confirmedBroadcastTps }
+    );
     
     // Success rate
-    const successRate = (tpsAnalysis.verifiedSuccessfulCount / tpsAnalysis.verifiedTxCount * 100).toFixed(2);
-    console.log(`\n   📈 Success Rate: ${successRate}% (${tpsAnalysis.verifiedSuccessfulCount}/${tpsAnalysis.verifiedTxCount})`);
+    const successRate = (tpsAnalysis.verifiedSuccessfulCount / tpsAnalysis.verifiedTxCount * 100).toFixed(1);
+    const rateColor = successRate >= 99 ? ui.colors.brightGreen : successRate >= 90 ? ui.colors.brightYellow : ui.colors.brightRed;
+    console.log(`\n   📈 Success Rate: ${rateColor}${successRate}%${ui.colors.reset} (${tpsAnalysis.verifiedSuccessfulCount}/${tpsAnalysis.verifiedTxCount})`);
     
-    console.log('\n📈 PEAK BLOCK:');
-    console.log(`   • Block number:          ${tpsAnalysis.peakBlock.number}`);
-    console.log(`   • Transactions:          ${tpsAnalysis.peakBlock.totalTxCount}`);
-    console.log(`   • Our transactions:      ${tpsAnalysis.peakBlock.ourTxCount}`);
-    console.log(`   • Gas used:              ${tpsAnalysis.peakBlock.gasUsed.toString()}`);
+    // Peak block
+    ui.printSubSection('Peak Block');
+    ui.printStats({
+      'Block number': tpsAnalysis.peakBlock.number,
+      'Our transactions': ui.style.value(tpsAnalysis.peakBlock.ourTxCount),
+      'Total transactions': tpsAnalysis.peakBlock.totalTxCount,
+    });
     
-    // Show per-block breakdown for small tests
-    if (tpsAnalysis.blockStats.length <= 30) {
-      console.log('\n📦 BLOCK-BY-BLOCK BREAKDOWN:');
-      console.log('   Block     | Timestamp | Our TXs | Total TXs | Gas Used');
-      console.log('   ' + '-'.repeat(60));
-      for (const block of tpsAnalysis.blockStats) {
-        console.log(`   ${block.number.toString().padStart(9)} | ${block.timestamp.toString().padStart(9)} | ${block.ourTxCount.toString().padStart(7)} | ${block.totalTxCount.toString().padStart(9)} | ${block.gasUsed.toString()}`);
-      }
+    // Block-by-block breakdown for small tests
+    if (tpsAnalysis.blockStats.length <= 15) {
+      console.log(`\n   ${ui.colors.dim}Block-by-block:${ui.colors.reset}`);
+      ui.printTable(
+        ['Block', 'Time', 'Our TXs', 'Total', 'Gas Used'],
+        tpsAnalysis.blockStats.map(b => [
+          b.number,
+          b.timestamp,
+          b.ourTxCount,
+          b.totalTxCount,
+          b.gasUsed.toString().slice(0, 10),
+        ]),
+        [10, 10, 8, 8, 12]
+      );
     }
   }
   
-  console.log('\n' + '='.repeat(70));
+  console.log(`\n${ui.colors.dim}${'─'.repeat(64)}${ui.colors.reset}`);
+  ui.success('Test completed!');
 }
 
 // =============================================================================
@@ -1002,50 +1038,60 @@ function generateReport(config, sendResult, confirmResult, tpsAnalysis) {
 // =============================================================================
 
 async function main() {
-  const config = parseArgs();
+  // Print banner
+  ui.printBanner();
   
-  console.log('🔥 Arbitrum Nitro TPS Battle Test');
-  console.log('='.repeat(50));
+  let config = parseArgs();
+  
+  // Interactive mode if no args or --interactive flag
+  if (config.interactive) {
+    config = await interactiveConfig(config);
+  }
+  
+  console.log(`\n${ui.colors.dim}Transaction Mix:${ui.colors.reset} ${ui.style.value(`${config.txMix.ethTransfer}%`)} ETH │ ${ui.style.value(`${config.txMix.tokenTransfer}%`)} Token │ ${ui.style.value(`${config.txMix.swap}%`)} Swap`);
   
   // Connect to provider
-  console.log(`\n🔗 Connecting to ${config.rpcUrl}...`);
+  ui.printSection('Connection', '🔗');
+  const spinner = ui.createSpinner(`Connecting to ${ui.style.dim(config.rpcUrl)}...`);
+  spinner.start();
+  
   const provider = new ethers.JsonRpcProvider(config.rpcUrl);
   
   try {
     const network = await provider.getNetwork();
-    console.log(`✅ Connected to chain ID: ${network.chainId}`);
+    spinner.stop(`Connected to chain ID: ${ui.style.value(network.chainId)}`, true);
     
     const blockNumber = await provider.getBlockNumber();
-    console.log(`   Current block: ${blockNumber}`);
+    ui.printKeyValue('Current block', blockNumber, 3);
   } catch (err) {
-    console.error(`❌ Failed to connect to RPC: ${err.message}`);
-    console.log('\nMake sure the Nitro dev node is running:');
-    console.log('  cd nitro-devnode && ./run-dev-node.sh');
+    spinner.stop(`Failed to connect: ${err.message}`, false);
+    console.log(`\n${ui.colors.dim}Make sure the Nitro dev node is running:${ui.colors.reset}`);
+    console.log(`  ${ui.style.highlight('cd nitro-devnode && ./run-dev-node.sh')}`);
     process.exit(1);
   }
   
   // Setup funder wallet
   const funderWallet = new ethers.Wallet(config.funderPrivateKey, provider);
   const funderBalance = await provider.getBalance(funderWallet.address);
-  console.log(`\n💰 Funder account: ${funderWallet.address}`);
-  console.log(`   Balance: ${ethers.formatEther(funderBalance)} ETH`);
-  
-  if (funderBalance < ethers.parseEther(String(config.senderCount * parseFloat(config.fundingAmount)))) {
-    console.error('❌ Insufficient funder balance');
-    process.exit(1);
-  }
+  console.log();
+  ui.printKeyValue('Funder', funderWallet.address, 3);
+  ui.printKeyValue('Balance', `${ethers.formatEther(funderBalance)} ETH`, 3);
   
   // Get chain ID for transaction signing
   const network = await provider.getNetwork();
   const chainId = network.chainId;
   
-  // Create and fund sender accounts
+  // Setup contracts if needed (Token, Uniswap)
+  const contracts = await setupContracts(config, provider, funderWallet);
+  config.contracts = contracts;
+  
+  // Create and fund sender accounts (with tokens and approvals if needed)
   const senders = await createAndFundSenders(
     provider,
     funderWallet,
     config.senderCount,
-    config.fundingAmount,
-    config
+    config,
+    contracts
   );
   
   if (senders.length === 0) {
@@ -1053,11 +1099,13 @@ async function main() {
     process.exit(1);
   }
   
-  // Small delay to ensure funding transactions are fully processed
-  await sleep(500);
+  // Small delay to ensure all setup transactions are fully processed
+  await sleep(1000);
   
   // Prepare and pre-sign all transactions
-  const { signedTxs, signDuration, expectedTxDetails } = await prepareAndSignTransactions(senders, config, chainId, provider);
+  const { signedTxs, signDuration, expectedTxDetails } = await prepareAndSignTransactions(
+    senders, config, chainId, provider, contracts
+  );
   
   if (signedTxs.length === 0) {
     console.error('❌ No transactions were signed successfully');
@@ -1078,8 +1126,11 @@ async function main() {
   // Wait for confirmations
   const confirmResult = await waitForConfirmations(provider, sendResult.txHashes);
   
-  // Analyze TPS from chain (with deep verification)
-  const tpsAnalysis = await analyzeBlockTPS(provider, confirmResult.receipts, broadcastStartTime, broadcastEndTime, expectedTxDetails, sendResult.txHashes, config);
+  // Analyze TPS from chain
+  const tpsAnalysis = await analyzeBlockTPS(
+    provider, confirmResult.receipts, broadcastStartTime, broadcastEndTime,
+    expectedTxDetails, sendResult.txHashes, config
+  );
   
   // Generate report
   generateReport(config, sendResult, confirmResult, tpsAnalysis);

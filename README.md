@@ -57,8 +57,9 @@ node tps-test.js [options]
 | `--senders=N` | Number of sender accounts | 50 |
 | `--concurrent=N` | Max concurrent HTTP requests | 200 |
 | `--txValue=N` | ETH value per transaction | 0.00000001 |
-| `--fundingAmount=N` | ETH to fund each sender | 0.1 |
+| `--fundingAmount=N` | ETH to fund each sender | 0.01 |
 | `--gasMultiplier=N` | Gas price multiplier (for fee spikes) | 2 |
+| `--txType=TYPE` | Transaction type (eth_transfer) | eth_transfer |
 | `--rpcUrl=URL` | RPC endpoint | http://127.0.0.1:8547 |
 | `--verifyAll` | Fetch & verify every tx individually | false |
 
@@ -75,27 +76,50 @@ node tps-test.js --txCount=5000 --senders=100 --verifyAll
 node tps-test.js --rpcUrl=http://localhost:8545 --txCount=1000
 ```
 
+## Architecture
+
+```
+tps-test.js          # Main script (broadcasting, verification, reporting)
+payload-generator.js # Transaction payload generation (modular, extensible)
+```
+
+### Payload Generator
+
+The `payload-generator.js` module handles transaction generation. Currently supports:
+- `eth_transfer` - Simple ETH transfers
+
+Future transaction types can be easily added:
+- `erc20_transfer` - ERC20 token transfers
+- `contract_call` - Smart contract interactions
+- `mixed` - Mix of different transaction types
+
 ## How It Works
 
 ### 1. Account Setup
 Creates multiple sender wallets and funds them from the pre-funded dev account. More senders = more parallel nonce sequences = higher throughput.
 
-### 2. Transaction Preparation
+### 2. Payload Generation (payload-generator.js)
+Generates transaction payloads based on `--txType`:
+- Fetches nonces for all senders in parallel
+- Creates transactions with proper gas pricing
+- Returns unsigned transactions for signing
+
+### 3. Transaction Signing
 Pre-signs all transactions with:
 - Sequential nonces per sender
 - EIP-1559 gas pricing with configurable buffer
 - Fixed gas limit (21000 for ETH transfers)
 
-### 3. Parallel Broadcasting
+### 4. Parallel Broadcasting
 Uses a worker pool to broadcast pre-signed transactions with high concurrency. No waiting for individual responses.
 
-### 4. Verification
+### 5. Verification
 Three levels of verification:
 - **Block-based**: Checks tx hashes exist in blocks
 - **Sample verification**: Fetches 10 random txs directly
-- **Full verification** (`--verifyAll`): Fetches every tx individually
+- **Full verification** (`--verifyAll`): Fetches every tx individually (worker pool for speed)
 
-### 5. TPS Analysis
+### 6. TPS Analysis
 Calculates TPS based on:
 - Block timestamps (coarse, second precision)
 - Actual broadcast duration (more accurate)

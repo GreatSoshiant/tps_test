@@ -8,9 +8,20 @@
     "test": "node tps-test.js",
     "quick": "node tps-test.js --txCount=500 --senders=50 --concurrent=100",
     "medium": "node tps-test.js --txCount=3000 --senders=100 --concurrent=200",
-    "stress": "node tps-test.js --txCount=10000 --senders=150 --concurrent=300"
+    "stress": "node tps-test.js --txCount=10000 --senders=150 --concurrent=300",
+    "mixed-quick": "node tps-test.js --txCount=500 --senders=50 --concurrent=100 --txMix=50:30:20",
+    "mixed-medium": "node tps-test.js --txCount=2000 --senders=100 --concurrent=200 --txMix=40:30:30",
+    "token-only": "node tps-test.js --txCount=1000 --senders=50 --concurrent=100 --txMix=0:100:0",
+    "swap-only": "node tps-test.js --txCount=500 --senders=50 --concurrent=100 --txMix=0:0:100",
+    "deploy-token": "node deploy-token.js",
+    "deploy-uniswap": "node deploy-uniswap.js",
+    "setup-dex": "node setup-dex.js"
   },
   "dependencies": {
-    "ethers": "^6.13.4"
+    "@openzeppelin/contracts": "^5.4.0",
+    "@uniswap/v2-core": "^1.0.1",
+    "@uniswap/v2-periphery": "^1.1.0-beta.0",
+    "ethers": "^6.13.4",
+    "solc": "^0.8.33"
   }
 }
