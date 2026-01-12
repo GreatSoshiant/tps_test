@@ -33,8 +33,8 @@ const CONFIG = {
   concurrentRequests: 200, // Max concurrent HTTP requests
 
   // Gas buffer multiplier (to handle base fee increases during test)
-  gasMultiplier: 2,       // 2x = safe for most tests, increase for long tests
-
+  gasMultiplier: 4,       // 4x = safe buffer for heavy load, prevents gas price errors
+  
   // Transaction mix (percentages for eth:token:swap)
   // Format: "eth:token:swap" e.g., "50:30:20" or "100:0:0" (default)
   txMix: { ethTransfer: 100, tokenTransfer: 0, swap: 0 },
